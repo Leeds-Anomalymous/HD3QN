@@ -73,7 +73,7 @@ class Transformer(nn.Module):
             
             self.dropout = nn.Dropout(dropout)
             self.norm_cross = nn.LayerNorm(d_model)
-            # 移除原有的 MultiheadAttention，因为我们要手动控制 Q/K 的维度匹配
+            
 
         # Dueling 头
         self.feature_layer = nn.Linear(d_model, 128)
@@ -108,7 +108,7 @@ class Transformer(nn.Module):
             
             # 2. Key: 将 State 投影到类别空间
             # 物理含义：预测每个时间步属于哪个类别
-            # [B, T, extra_dim]
+            # [B, T, d_model]
             keys = self.key_proj(enc_output)  # [B, T, d_model]
             
             # 3. Value: State 的特征表示
@@ -116,7 +116,7 @@ class Transformer(nn.Module):
             values = self.value_proj(enc_output)
             
             # 4. 计算 Attention Scores: Query * Key^T
-            # [B, 1, extra_dim] @ [B, extra_dim, T] -> [B, 1, T]
+            # [B, 1, d_model] @ [B, d_model, T] -> [B, 1, T]
             # 含义：Goal类别 与 每个时间步的类别预测值 的匹配程度
             scores = torch.bmm(query, keys.transpose(1, 2)) / (self.d_model ** 0.5)
             
