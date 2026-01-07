@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from collections import deque, defaultdict
+from collections import deque
 from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
@@ -38,88 +38,6 @@ class HierarchicalTransformer(nn.Module):
         goal = goal.float()
         return self.transformer(state, extra_features=goal)
 
-# class ReplayMemory:
-#     """普通经验回放池（用于高层策略）"""
-#     def __init__(self, capacity):
-#         self.memory = deque(maxlen=capacity)
-        
-#     def push(self, data):
-#         """存储经验"""
-#         self.memory.append(data)
-        
-#     def sample(self, batch_size):
-#         """随机采样"""
-#         return random.sample(self.memory, min(batch_size, len(self.memory)))
-    
-#     def __len__(self):
-#         return len(self.memory)
-
-class PrioritizedReplayMemory:
-    """
-    优先级经验回放池 (Prioritized Experience Replay)
-    使用 TD-error 作为优先级，配合 SumTree 数据结构实现高效采样
-    """
-    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
-        self.capacity = capacity
-        self.alpha = alpha  # 优先级指数
-        self.beta_start = beta_start  # 重要性采样权重初始值
-        self.beta_frames = beta_frames
-        self.frame = 1
-        
-        # 使用 deque 简化实现，存储 (priority, data)
-        self.buffer = deque(maxlen=capacity)
-        self.priorities = deque(maxlen=capacity)
-        self.max_priority = 1.0
-        
-    def push(self, data, error=None):
-        """
-        data: 经验元组
-        error: TD-error，如果为 None 则使用最大优先级
-        """
-        priority = self.max_priority if error is None else (abs(error) + 1e-6) ** self.alpha
-        self.buffer.append(data)
-        self.priorities.append(priority)
-        
-    def sample(self, batch_size):
-        """
-        基于优先级进行采样，返回 (batch, indices, weights)
-        """
-        if len(self.buffer) == 0:
-            return [], [], []
-            
-        batch_size = min(batch_size, len(self.buffer))
-        
-        # 计算采样概率
-        priorities = np.array(self.priorities)
-        probabilities = priorities / priorities.sum()
-        
-        # 根据优先级采样
-        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities, replace=False)
-        samples = [self.buffer[idx] for idx in indices]
-        
-        # 计算重要性采样权重
-        beta = min(1.0, self.beta_start + self.frame * (1.0 - self.beta_start) / self.beta_frames)
-        weights = (len(self.buffer) * probabilities[indices]) ** (-beta)
-        weights /= weights.max()  # 归一化权重
-        
-        self.frame += 1
-        
-        return samples, indices, weights
-    
-    def update_priorities(self, indices, errors):
-        """
-        更新指定索引样本的优先级
-        indices: 样本索引列表
-        errors: 对应的 TD-error 列表
-        """
-        for idx, error in zip(indices, errors):
-            priority = (abs(error) + 1e-6) ** self.alpha
-            self.priorities[idx] = priority
-            self.max_priority = max(self.max_priority, priority)
-    
-    def __len__(self):
-        return len(self.buffer)
-
 class HierarchicalDQN():
     def __init__(self, input_shape, rho=0.01, reward_multiplier=1.0, high_discount_factor=0.1, low_discount_factor=0.01, num_classes=9):
         # self.discount_factor = discount_factor
@@ -129,10 +47,9 @@ class HierarchicalDQN():
         self.rho = rho
         self.reward_multiplier = reward_multiplier
         self.num_classes = num_classes
-        # 移除 OOD 相关设定
-        self.total_low_actions = num_classes
-        # self.ood_action = num_classes
-        # self.ood_reward_scale = 0.1
+        self.ood_action = num_classes  # OOD 类别索引
+        self.total_low_actions = num_classes + 1
+        self.ood_reward_scale = 0.1
         self.t_max = 120000
         # 分别定义高层和低层的软更新系数
         self.high_eta = 0.05  # 高层策略的软更新系数
@@ -170,9 +87,9 @@ class HierarchicalDQN():
         self.high_optimizer = optim.Adam(self.high_q_net.parameters(), lr=self.learning_rate)
         self.low_optimizer = optim.Adam(self.low_q_net.parameters(), lr=self.learning_rate)
         
-        # [修改] 使用 PrioritizedReplayMemory 替代 ClassBalancedReplayMemory
-        self.high_replay_memory = PrioritizedReplayMemory(capacity=self.mem_size, alpha=0.6)
-        self.low_replay_memory = PrioritizedReplayMemory(capacity=self.mem_size, alpha=0.6)
+        # 经验回放池
+        self.high_replay_memory = deque(maxlen=self.mem_size)
+        self.low_replay_memory = deque(maxlen=self.mem_size)
         
         # 设备配置
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -209,11 +126,19 @@ class HierarchicalDQN():
         """将原始标签转换为高层目标"""
         return self.class_to_goal[label]
 
-    def get_action_mask(self, goal):
-        """根据高层目标生成动作掩码"""
+    def get_action_mask(self, goal, allow_ood=True):
+        """根据高层目标生成动作掩码
+        当 goal=0(正常类) 时，屏蔽 OOD 动作
+        其他目标时，根据 allow_ood 参数决定是否允许 OOD
+        """
         mask = torch.zeros(self.total_low_actions, device=self.device)
         valid_actions = self.high_level_mapping[goal]
         mask[valid_actions] = 1.0
+        
+        # 目标为0时始终屏蔽OOD，其他目标根据allow_ood参数决定
+        if goal != 0 and allow_ood:
+            mask[self.ood_action] = 1.0
+        
         return mask
     def select_high_level_action(self, state):
         """选择高层动作(目标)"""
@@ -225,30 +150,56 @@ class HierarchicalDQN():
             return q_values.argmax().item()
 
     def select_low_level_action(self, state, goal):
-        """选择低层动作(具体类别),受goal限制"""
+        """选择低层动作(具体类别),受goal限制
+        当 goal=0 时，不允许选择 OOD 动作
+        """
         goal_onehot = F.one_hot(torch.tensor([goal]), num_classes=3).float().to(self.device)
         
         if random.random() < self.epsilon:
             valid_actions = list(self.high_level_mapping[goal])
+            # 目标为0时不添加OOD动作，其他目标添加
+            if goal != 0:
+                valid_actions.append(self.ood_action)
             return random.choice(valid_actions)
         else:
             with torch.no_grad():
                 q_values = self.low_q_net(state, goal_onehot)
+                # 应用掩码时，目标为0会自动屏蔽OOD
                 mask = self.get_action_mask(goal)
                 masked_q = q_values.clone()
                 masked_q[0, mask == 0] = -float('inf')
             return masked_q.argmax().item()
 
-    def compute_reward(self, action, target, level="low"):
-        """计算奖励, 不使用 OOD 机制"""
+    def compute_reward(self, action, target, level="low", high_action=None, true_goal=None):
+        """计算奖励, 根据层级选择权重"""
         weights = self.high_reward_weights if level == "high" else self.reward_weights
         weight = weights.get(target, 1.0)
         terminal = False
         update = True
 
+        # 低层 OOD 特殊情况：仅处理高层错误时的纠错奖励
+        if level == "low" and high_action is not None and true_goal is not None:
+            # 如果高层选择错误
+            if high_action != true_goal:
+                if action == self.ood_action:
+                    # 纠错成功：给予带权重的正奖励（较小）
+                    reward = self.reward_multiplier * self.ood_reward_scale * weight
+                    update = True
+                else:
+                    # 错上加错：给予标准惩罚
+                    reward = -weight * self.reward_multiplier
+                    update = False
+                terminal = True  # 高层错误时必须终止
+                return reward, terminal, update
+                
+        # 正常奖励计算
+        # 涵盖了：
+        # 1. 高层策略的奖励计算
+        # 2. 高层正确时，低层策略的奖励计算（包括选对、选错类、选OOD）
         if action == target:
             reward = weight * self.reward_multiplier
         else:
+            # 选错（包括在高层正确时选了OOD）
             reward = -weight * self.reward_multiplier
             terminal = True
             update = False
@@ -256,11 +207,11 @@ class HierarchicalDQN():
         return reward, terminal, update
 
     def replay_high_level(self, update_target=True):
-        """训练高层策略 - 使用优先级采样"""
-        batch, indices, weights = self.high_replay_memory.sample(self.batch_size)
-        if not batch:
+        """训练高层策略"""
+        if len(self.high_replay_memory) < self.batch_size:
             return
             
+        batch = random.sample(self.high_replay_memory, self.batch_size)
         states, actions, rewards, next_states, terminals = zip(*batch)
         
         states = torch.stack(states).to(self.device)
@@ -268,38 +219,34 @@ class HierarchicalDQN():
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
         next_states = torch.stack(next_states).to(self.device)
         terminals = torch.tensor(terminals, dtype=torch.bool, device=self.device).unsqueeze(1)
-        weights = torch.tensor(weights, dtype=torch.float32, device=self.device).unsqueeze(1)
         
         # 计算当前Q值
         current_q = self.high_q_net(states).gather(1, actions)
         
-        # 计算目标Q值
+        # 计算目标Q值 - 使用高层折扣因子
         with torch.no_grad():
             next_q = self.high_target_net(next_states).max(1, keepdim=True)[0]
             target_q = rewards + self.high_discount_factor * next_q * (~terminals)
         
-        # 计算 TD-error 并更新优先级
-        td_errors = (current_q - target_q).detach().cpu().numpy().flatten()
-        self.high_replay_memory.update_priorities(indices, td_errors)
-        
-        # 使用重要性采样权重计算损失
-        loss = (weights * F.mse_loss(current_q, target_q, reduction='none')).mean()
+        # 计算损失并更新
+        loss = F.mse_loss(current_q, target_q)
         self.high_loss_history.append(loss.item())
         
         self.high_optimizer.zero_grad()
         loss.backward()
         self.high_optimizer.step()
         
+        # 软更新目标网络 - 使用高层eta
         if update_target:
             for target_param, param in zip(self.high_target_net.parameters(), self.high_q_net.parameters()):
                 target_param.data.copy_(self.high_eta * param.data + (1.0 - self.high_eta) * target_param.data)
 
     def replay_low_level(self, update_target=True):
-        """训练低层策略 - 使用优先级采样"""
-        batch, indices, weights = self.low_replay_memory.sample(self.batch_size)
-        if not batch:
-            return
+        """训练低层策略"""
+        # if len(self.low_replay_memory) < self.batch_size:
+        #     return
             
+        batch = random.sample(self.low_replay_memory, self.batch_size)
         states, goals, actions, rewards, next_states, next_goals, terminals = zip(*batch)
         
         states = torch.stack(states).to(self.device)
@@ -309,14 +256,14 @@ class HierarchicalDQN():
         next_states = torch.stack(next_states).to(self.device)
         next_goals = torch.stack(next_goals).to(self.device)
         terminals = torch.tensor(terminals, dtype=torch.bool, device=self.device).unsqueeze(1)
-        weights = torch.tensor(weights, dtype=torch.float32, device=self.device).unsqueeze(1)
         
         # 计算当前Q值
         current_q = self.low_q_net(states, goals).gather(1, actions)
         
-        # 计算目标Q值
+        # 计算目标Q值 - 使用低层折扣因子
         with torch.no_grad():
             next_q_values = self.low_target_net(next_states, next_goals)
+            # 应用掩码到next_q
             batch_size = next_q_values.size(0)
             for i in range(batch_size):
                 goal_idx = next_goals[i].argmax().item()
@@ -325,24 +272,21 @@ class HierarchicalDQN():
             next_q = next_q_values.max(1, keepdim=True)[0]
             target_q = rewards + self.low_discount_factor * next_q * (~terminals)
         
-        # 计算 TD-error 并更新优先级
-        td_errors = (current_q - target_q).detach().cpu().numpy().flatten()
-        self.low_replay_memory.update_priorities(indices, td_errors)
-        
-        # 使用重要性采样权重计算损失
-        loss = (weights * F.mse_loss(current_q, target_q, reduction='none')).mean()
+        # 计算损失并更新
+        loss = F.mse_loss(current_q, target_q)
         self.low_loss_history.append(loss.item())
         
         self.low_optimizer.zero_grad()
         loss.backward()
         self.low_optimizer.step()
         
+        # 软更新目标网络 - 使用低层eta
         if update_target:
             for target_param, param in zip(self.low_target_net.parameters(), self.low_q_net.parameters()):
                 target_param.data.copy_(self.low_eta * param.data + (1.0 - self.low_eta) * target_param.data)
 
     def train(self, dataset):
-        """训练分层DQN - 使用优先级经验回放"""
+        """训练分层DQN - 高层和低层各做一次决策"""
         dist_info = dataset.get_class_distribution()
         if dist_info["reward_weights"] is not None:
             self.set_reward_weights(dist_info["reward_weights"])
@@ -351,9 +295,6 @@ class HierarchicalDQN():
         
         self.step_count = 0
         episode = 0
-        
-        # [修改] 简化预热逻辑 - PER 不需要类别平衡预热
-        min_samples_before_training = 1000  # 最少样本数后开始训练
         
         total_pbar = tqdm(total=self.t_max, desc="Training Progress", unit="step")
         
@@ -375,19 +316,21 @@ class HierarchicalDQN():
                     next_state = states[i+1:i+2]
                     next_label = labels[i+1].item()
                     
+                    # 获取真实的高层目标
                     true_goal = self.get_goal_from_label(current_label)
                     next_true_goal = self.get_goal_from_label(next_label)
                     
-                    # 1. 高层策略选择目标
+                    # 1. 高层策略选择目标(做一次决策)
                     high_action = self.select_high_level_action(current_state)
                     goal_onehot = F.one_hot(torch.tensor([high_action]), num_classes=3).float()
                     
+                    # 计算高层奖励
                     high_reward, high_terminal, high_update = self.compute_reward(
                         high_action, true_goal, level="high"
                     )
                     
-                    # [修改] 使用 PER，不需要 label 参数
-                    self.high_replay_memory.push((
+                    # 存储高层经验
+                    self.high_replay_memory.append((
                         current_state.squeeze(0).cpu().clone().detach(),
                         high_action,
                         high_reward,
@@ -395,34 +338,37 @@ class HierarchicalDQN():
                         high_terminal
                     ))
                     
-                    # 2. 低层策略选择动作
+                    # 2. 低层策略选择动作(做一次决策)
                     low_action = self.select_low_level_action(current_state, high_action)
                     
+                    # 计算低层奖励
                     low_reward, low_terminal, low_update = self.compute_reward(
-                        low_action, current_label, level="low"
+                        low_action, current_label, level="low",
+                        high_action=high_action, true_goal=true_goal
                     )
                     
+                    # 下一步的目标(基于下一状态的高层决策)
+                    # [修改] 启用下一目标的计算，因为低层价值评估依赖于下一时刻高层实际给出的Goal
                     next_high_action = self.select_high_level_action(next_state)
                     next_goal_onehot = F.one_hot(torch.tensor([next_high_action]), num_classes=3).float()
                     
-                    self.low_replay_memory.push((
-                        current_state.squeeze(0).cpu().clone().detach(),
-                        goal_onehot.squeeze(0).cpu().clone().detach(),
-                        low_action,
-                        low_reward,
-                        next_state.squeeze(0).cpu().clone().detach(),
-                        next_goal_onehot.squeeze(0).cpu().clone().detach(),
-                        low_terminal
+                    # 存储低层经验
+                    self.low_replay_memory.append((
+                        current_state.squeeze(0).cpu().clone().detach(),      # 当前状态
+                        goal_onehot.squeeze(0).cpu().clone().detach(),        # 当前目标
+                        low_action,                                            # 选择的动作
+                        low_reward,                                            # 获得的奖励
+                        next_state.squeeze(0).cpu().clone().detach(),         # 下一状态
+                        next_goal_onehot.squeeze(0).cpu().clone().detach(),   # [修改] 使用 next_goal_onehot
+                        low_terminal                                           # 是否终止
                     ))
                     
-                    # 3. 训练网络（简化预热检查）
+                    # 3. 训练网络
                     performed_update = False
-                    
-                    if len(self.high_replay_memory) >= min_samples_before_training:
+                    if len(self.high_replay_memory) >= self.batch_size:
                         self.replay_high_level(update_target=high_update)
                         performed_update = True
-                    
-                    if len(self.low_replay_memory) >= min_samples_before_training:
+                    if len(self.low_replay_memory) >= self.batch_size:
                         self.replay_low_level(update_target=low_update)
                         performed_update = True
                     
@@ -443,16 +389,6 @@ class HierarchicalDQN():
         
         total_pbar.close()
         print("训练完成!")
-        # print(f"最终高层经验池大小: {len(self.high_replay_memory)}")
-        # print(f"最终低层经验池大小: {len(self.low_replay_memory)}")
-        # if warmup_complete_high:
-        #     print("高层策略完成预热训练")
-        # else:
-        #     print("警告: 高层策略未完成预热！")
-        # if warmup_complete_low:
-        #     print("低层策略完成预热训练")
-        # else:
-        #     print("警告: 低层策略未完成预热！")
 
     def plot_loss(self, save_path):
         """绘制损失曲线"""
@@ -478,140 +414,167 @@ class HierarchicalDQN():
 def main():
     tbm_configs = [('TBM_0.01', 0.01)]
     reward_multipliers = [1]
-    discount_factor_pairs = [(0.1, 0.1)]
-    eta_pairs = [(0.05, 0.05)]
+    # 将高层和低层折扣因子成对定义
+    discount_factor_pairs = [(0.1, 0.1)]  # (高层折扣因子, 低层折扣因子)
+    # 新增：高层和低层eta的成对定义，用于参数敏感性分析
+    eta_pairs = [(0.05, 0.05)]  # (high_eta, low_eta)
     model_variants = ['Hierarchical_Transformer']
-    # 移除 OOD 奖励缩放遍历
-    save_dir = '/workspace/RL/DRLimb-Multi/final_hierarchical_results/Prioritized_replay'
+    # 新增OOD奖励缩放系数的遍历
+    # ood_reward_scales = list(np.linspace(0.1, 1, 5))
+    ood_reward_scales = [0.5]
+    
+    save_dir = '/workspace/RL/DRLimb-Multi/final_hierarchical_results/cross_atten3_next_goal_onehot'
     os.makedirs(save_dir, exist_ok=True)
     
     for model_variant in model_variants:
         for dataset_name, rho in tbm_configs:
             for reward_multiplier in reward_multipliers:
                 for high_discount_factor, low_discount_factor in discount_factor_pairs:
-                    for high_eta, low_eta in eta_pairs:
-                        print(f"\n{'='*70}")
-                        print(f"开始处理数据集: {dataset_name}, 模型: {model_variant}")
-                        print(f"奖励倍数: {reward_multiplier}, 高层折扣因子: {high_discount_factor}, 低层折扣因子: {low_discount_factor}")
-                        print(f"高层eta: {high_eta}, 低层eta: {low_eta}")
-                        print(f"{'='*70}")
-                        
-                        input_shape = (1024, 3)
-                        
-                        try:
-                            dataset = ImbalancedDataset(dataset_name=dataset_name, rho=rho, batch_size=64)
-                            _, test_loader = dataset.get_dataloaders()
-                            num_classes = 9
-                            num_runs = 5
-                            training_ratio = 1
+                    for high_eta, low_eta in eta_pairs:  # 新增eta遍历
+                        for ood_reward_scale in ood_reward_scales:
+                            print(f"\n{'='*70}")
+                            print(f"开始处理数据集: {dataset_name}, 模型: {model_variant}")
+                            print(f"奖励倍数: {reward_multiplier}, 高层折扣因子: {high_discount_factor}, 低层折扣因子: {low_discount_factor}")
+                            print(f"高层eta: {high_eta}, 低层eta: {low_eta}")  # 新增打印
+                            print(f"OOD奖励缩放: {ood_reward_scale}")
+                            print(f"{'='*70}")
                             
-                            if not TEST_ONLY:
-                                for run in range(1, num_runs + 1):
-                                    print(f"\n{'='*50}")
-                                    print(f"开始第 {run} 次训练")
-                                    print(f"{'='*50}")
-                                    
-                                    classifier = HierarchicalDQN(
-                                        input_shape, rho=rho,
-                                        reward_multiplier=reward_multiplier,
-                                        high_discount_factor=high_discount_factor,
-                                        low_discount_factor=low_discount_factor,
-                                        num_classes=num_classes
-                                    )
-                                    classifier.high_eta = high_eta
-                                    classifier.low_eta = low_eta
-                                    
-                                    classifier.train(dataset)
-                                    
-                                    model_filename = f'{dataset_name}_rho{rho}_{model_variant}_reward{reward_multiplier}_highGamma{high_discount_factor}_lowGamma{low_discount_factor}_highEta{high_eta}_lowEta{low_eta}_第{run}次.pth'
-                                    model_path = os.path.join(save_dir, model_filename)
-                                    
-                                    torch.save({
-                                        'high_q_net': classifier.high_q_net.state_dict(),
-                                        'low_q_net': classifier.low_q_net.state_dict(),
-                                        'high_eta': classifier.high_eta,
-                                        'low_eta': classifier.low_eta
-                                    }, model_path)
-                                    print(f"模型已保存到 {model_path}")
-                                    
-                                    loss_filename = f'{dataset_name}_rho{rho}_{model_variant}_reward{reward_multiplier}_highGamma{high_discount_factor}_lowGamma{low_discount_factor}_highEta{high_eta}_lowEta{low_eta}_第{run}次_loss.png'
-                                    loss_path = os.path.join(save_dir, loss_filename)
-                                    classifier.plot_loss(loss_path)
-                                    
-                                    print(f"\n开始评估第 {run} 次训练的模型...")
-                                    metrics, high_accuracy = evaluate_model_hierarchical(
-                                        hierarchical_dqn=classifier,
-                                        test_loader=test_loader,
-                                        save_dir=save_dir,
-                                        dataset_name=dataset_name,
-                                        training_ratio=training_ratio,
-                                        rho=rho,
-                                        dataset_obj=dataset,
-                                        run_number=run,
-                                        model_type=model_variant,
-                                        reward_multiplier=reward_multiplier,
-                                        high_discount_factor=high_discount_factor,
-                                        low_discount_factor=low_discount_factor,
-                                        high_eta=high_eta,
-                                        low_eta=low_eta
-                                    )
-                            else:
-                                # TEST_ONLY模式: 只进行评估
-                                print("\n进入评估模式...")
-                                for run in range(1, num_runs + 1):
-                                    print(f"\n{'='*50}")
-                                    print(f"加载并评估第 {run} 次训练的模型")
-                                    print(f"{'='*50}")
-                                    
-                                    # 加载模型
-                                    model_filename = f'{dataset_name}_rho{rho}_{model_variant}_reward{reward_multiplier}_highGamma{high_discount_factor}_lowGamma{low_discount_factor}_highEta{high_eta}_lowEta{low_eta}_第{run}次.pth'
-                                    model_path = os.path.join(save_dir, model_filename)
-                                    
-                                    if not os.path.exists(model_path):
-                                        print(f"模型文件不存在: {model_path}")
-                                        continue
-                                    
-                                    # 创建模型实例
-                                    classifier = HierarchicalDQN(
-                                        input_shape, rho=rho,
-                                        reward_multiplier=reward_multiplier,
-                                        high_discount_factor=high_discount_factor,
-                                        low_discount_factor=low_discount_factor,
-                                        num_classes=num_classes
-                                    )
-                                    
-                                    # 加载权重
-                                    checkpoint = torch.load(model_path)
-                                    classifier.high_q_net.load_state_dict(checkpoint['high_q_net'])
-                                    classifier.low_q_net.load_state_dict(checkpoint['low_q_net'])
-                                    classifier.high_eta = checkpoint.get('high_eta', high_eta)
-                                    classifier.low_eta = checkpoint.get('low_eta', low_eta)
-                                    print(f"已加载模型: {model_path}")
-                                    
-                                    # 评估模型
-                                    metrics, high_accuracy = evaluate_model_hierarchical(
-                                        hierarchical_dqn=classifier,
-                                        test_loader=test_loader,
-                                        save_dir=save_dir,
-                                        dataset_name=dataset_name,
-                                        training_ratio=training_ratio,
-                                        rho=rho,
-                                        dataset_obj=dataset,
-                                        run_number=run,
-                                        model_type=model_variant,
-                                        reward_multiplier=reward_multiplier,
-                                        high_discount_factor=high_discount_factor,
-                                        low_discount_factor=low_discount_factor,
-                                        high_eta=high_eta,
-                                        low_eta=low_eta
-                                    )
-                                    
-                                    print(f"第 {run} 次模型评估完成")          
-                        except Exception as e:
-                            print(f"处理配置时出错: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            continue
+                            input_shape = (1024, 3)
+                            
+                            try:
+                                dataset = ImbalancedDataset(dataset_name=dataset_name, rho=rho, batch_size=64)
+                                _, test_loader = dataset.get_dataloaders()
+                                num_classes = 9
+                                num_runs = 5
+                                training_ratio = 1
+                                
+                                if not TEST_ONLY:
+                                    for run in range(1, num_runs + 1):
+                                        print(f"\n{'='*50}")
+                                        print(f"开始第 {run} 次训练")
+                                        print(f"{'='*50}")
+                                        
+                                        classifier = HierarchicalDQN(
+                                            input_shape, rho=rho,
+                                            reward_multiplier=reward_multiplier,
+                                            high_discount_factor=high_discount_factor,
+                                            low_discount_factor=low_discount_factor,
+                                            num_classes=num_classes
+                                        )
+                                        # 设置OOD奖励缩放系数和eta参数
+                                        classifier.ood_reward_scale = ood_reward_scale
+                                        classifier.high_eta = high_eta
+                                        classifier.low_eta = low_eta
+                                        
+                                        classifier.train(dataset)
+                                        
+                                        # 保存模型（文件名包含eta参数）
+                                        model_filename = f'{dataset_name}_rho{rho}_{model_variant}_reward{reward_multiplier}_highGamma{high_discount_factor}_lowGamma{low_discount_factor}_highEta{high_eta}_lowEta{low_eta}_oodScale{ood_reward_scale}_第{run}次.pth'
+                                        model_path = os.path.join(save_dir, model_filename)
+                                        
+                                        torch.save({
+                                            'high_q_net': classifier.high_q_net.state_dict(),
+                                            'low_q_net': classifier.low_q_net.state_dict(),
+                                            'ood_reward_scale': classifier.ood_reward_scale,
+                                            'high_eta': classifier.high_eta,  # 新增保存
+                                            'low_eta': classifier.low_eta      # 新增保存
+                                        }, model_path)
+                                        print(f"模型已保存到 {model_path}")
+                                        
+                                        # 绘制损失曲线
+                                        loss_filename = f'{dataset_name}_rho{rho}_{model_variant}_reward{reward_multiplier}_highGamma{high_discount_factor}_lowGamma{low_discount_factor}_highEta{high_eta}_lowEta{low_eta}_oodScale{ood_reward_scale}_第{run}次_loss.png'
+                                        loss_path = os.path.join(save_dir, loss_filename)
+                                        classifier.plot_loss(loss_path)
+                                        
+                                        # 评估模型
+                                        print(f"\n开始评估第 {run} 次训练的模型...")
+                                        metrics, high_accuracy = evaluate_model_hierarchical(
+                                            hierarchical_dqn=classifier,
+                                            test_loader=test_loader,
+                                            save_dir=save_dir,
+                                            dataset_name=dataset_name,
+                                            training_ratio=training_ratio,
+                                            rho=rho,
+                                            dataset_obj=dataset,
+                                            run_number=run,
+                                            model_type=model_variant,
+                                            reward_multiplier=reward_multiplier,
+                                            high_discount_factor=high_discount_factor,
+                                            low_discount_factor=low_discount_factor,
+                                            high_eta=high_eta,  # 新增参数
+                                            low_eta=low_eta,    # 新增参数
+                                            ood_reward_scale=ood_reward_scale
+                                        )
+                                
+                                else:
+                                    # TEST_ONLY模式: 只进行评估
+                                    print("\n进入评估模式...")
+                                    for run in range(1, num_runs + 1):
+                                        print(f"\n{'='*50}")
+                                        print(f"加载并评估第 {run} 次训练的模型")
+                                        print(f"{'='*50}")
+                                        
+                                        # 加载模型
+                                        model_filename = f'{dataset_name}_rho{rho}_{model_variant}_reward{reward_multiplier}_highGamma{high_discount_factor}_lowGamma{low_discount_factor}_highEta{high_eta}_lowEta{low_eta}_oodScale{ood_reward_scale}_第{run}次.pth'
+                                        model_path = os.path.join(save_dir, model_filename)
+                                        
+                                        if not os.path.exists(model_path):
+                                            print(f"模型文件不存在: {model_path}")
+                                            continue
+                                        
+                                        # 创建模型实例
+                                        classifier = HierarchicalDQN(
+                                            input_shape, rho=rho,
+                                            reward_multiplier=reward_multiplier,
+                                            high_discount_factor=high_discount_factor,
+                                            low_discount_factor=low_discount_factor,
+                                            num_classes=num_classes
+                                        )
+                                        
+                                        # 加载权重
+                                        checkpoint = torch.load(model_path)
+                                        classifier.high_q_net.load_state_dict(checkpoint['high_q_net'])
+                                        classifier.low_q_net.load_state_dict(checkpoint['low_q_net'])
+                                        # 加载参数
+                                        if 'ood_reward_scale' in checkpoint:
+                                            classifier.ood_reward_scale = checkpoint['ood_reward_scale']
+                                        else:
+                                            classifier.ood_reward_scale = ood_reward_scale
+                                        if 'high_eta' in checkpoint:
+                                            classifier.high_eta = checkpoint['high_eta']
+                                        else:
+                                            classifier.high_eta = high_eta
+                                        if 'low_eta' in checkpoint:
+                                            classifier.low_eta = checkpoint['low_eta']
+                                        else:
+                                            classifier.low_eta = low_eta
+                                        print(f"已加载模型: {model_path}")
+                                        
+                                        # 评估模型
+                                        metrics, high_accuracy = evaluate_model_hierarchical(
+                                            hierarchical_dqn=classifier,
+                                            test_loader=test_loader,
+                                            save_dir=save_dir,
+                                            dataset_name=dataset_name,
+                                            training_ratio=training_ratio,
+                                            rho=rho,
+                                            dataset_obj=dataset,
+                                            run_number=run,
+                                            model_type=model_variant,
+                                            reward_multiplier=reward_multiplier,
+                                            high_discount_factor=high_discount_factor,
+                                            low_discount_factor=low_discount_factor,
+                                            high_eta=high_eta,  # 新增参数
+                                            low_eta=low_eta,    # 新增参数
+                                            ood_reward_scale=ood_reward_scale
+                                        )
+                                        
+                                        print(f"第 {run} 次模型评估完成")          
+                            except Exception as e:
+                                print(f"处理配置时出错: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                continue
 
 if __name__ == "__main__":
     main()
