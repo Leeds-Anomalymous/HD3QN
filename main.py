@@ -423,7 +423,7 @@ def main():
     # ood_reward_scales = list(np.linspace(0.1, 1, 5))
     ood_reward_scales = [0.5]
     
-    save_dir = '/workspace/RL/DRLimb-Multi/final_hierarchical_results/cross_atten3_next_goal_onehot'
+    save_dir = '/workspace/RL/HD3QN/No-cross-Norm_replay/results'
     os.makedirs(save_dir, exist_ok=True)
     
     for model_variant in model_variants:

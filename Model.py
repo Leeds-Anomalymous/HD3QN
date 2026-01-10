@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-import torch.nn.functional as F
 
 class BiLSTM(nn.Module):
     def __init__(self, input_shape, output_dim=2):
@@ -33,26 +32,49 @@ class BiLSTM(nn.Module):
         self.advantage_stream = nn.Linear(128, num_classes)
         
     def forward(self, x):
+        # 确保输入在正确的设备上
         device = next(self.parameters()).device
-        x = x.to(device).float()
+        x = x.to(device)
+        
+        # 处理输入维度: [batch, channels, length] -> [batch, length, channels]
+        # if len(x.shape) == 4:
+        #     batch_size, channels, height, width = x.shape
+        #     x = x.squeeze(2).permute(0, 2, 1)  # [batch, channels, length] -> [batch, length, channels]
+        # elif len(x.shape) == 3:
+        #     # 假设输入是 [batch, channels, length]，需要转为 [batch, length, channels]
+        # x = x.permute(0, 2, 1)
+
+        
+        # LSTM 期望输入形状为 [batch, seq_len, input_size]
+        # 初始化隐藏状态
+        x = x.float()
         h0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(device)
         c0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(device)
-        out, _ = self.lstm(x, (h0, c0)) # [batch, seq_len, hidden_size*2]
+        
+        # 前向传播BiLSTM
+        out, _ = self.lstm(x, (h0, c0)) #out的维度: [batch, seq_len, hidden_size*2]
+        
+        # 取最后一个时间步的输出作为特征
         features = self.relu(self.feature_layer(out[:, -1, :]))
+        
+        # 计算状态值
         values = self.value_stream(features)
+        
+        # 计算优势函数
         advantages = self.advantage_stream(features)
+        
+        # 组合状态值和优势函数: Q(s,a) = V(s) + A(s,a) - mean(A(s,:))
         q_values = values + advantages - advantages.mean(dim=1, keepdim=True)
+        
         return q_values
 
 class Transformer(nn.Module):
     def __init__(self, input_shape, output_dim=2, d_model=128, n_heads=2, num_layers=2, dropout=0.1, extra_dim=0):
         super().__init__()
         len_window, feature_dim = input_shape
-        self.d_model = d_model
-        # 状态投影
-        self.input_proj = nn.Linear(feature_dim, d_model)
+        # 直接在输入特征维拼接额外特征
+        self.input_proj = nn.Linear(feature_dim + extra_dim, d_model)
         self.register_buffer("pos_encoding", self._build_positional_encoding(len_window, d_model))
-        
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -61,21 +83,6 @@ class Transformer(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # 引入 cross attention 以融合 Goal（extra_dim>0 时生效）
-        self.extra_dim = extra_dim
-        if extra_dim > 0:
-            # 修改：实现基于类别的语义Attention
-            # Key: 将振动数据投影到类别空间 (0/K/M)，维度为 extra_dim
-            self.goal_embedding = nn.Linear(extra_dim, d_model)  # 学习goal表示
-            self.key_proj = nn.Linear(d_model, d_model)  # 保持特征维度
-            self.value_proj = nn.Linear(d_model, d_model)
-            
-            self.dropout = nn.Dropout(dropout)
-            self.norm_cross = nn.LayerNorm(d_model)
-            # 移除原有的 MultiheadAttention，因为我们要手动控制 Q/K 的维度匹配
-
-        # Dueling 头
         self.feature_layer = nn.Linear(d_model, 128)
         self.relu = nn.ReLU()
         self.value_stream = nn.Linear(128, 1)
@@ -92,164 +99,16 @@ class Transformer(nn.Module):
     def forward(self, x, extra_features=None):
         device = next(self.parameters()).device
         x = x.to(device).float()
+        # 将额外特征在时间维复制后与输入的特征维拼接
+        if extra_features is not None:
+            ef = extra_features.to(device).float()                     # [B, F_extra]
+            ef_expanded = ef.unsqueeze(1).expand(-1, x.size(1), -1)   # [B, T, F_extra]
+            x = torch.cat([x, ef_expanded], dim=-1)                    # [B, T, F+F_extra]
         x = self.input_proj(x)
         x = x + self.pos_encoding[:, : x.size(1)].to(x.dtype)
-
-        # 状态编码
-        enc_output = self.encoder(x)  # [B, T, d_model]
-
-        # 使用 Goal 作为 Query 进行 cross attention
-        if self.extra_dim > 0 and extra_features is not None:
-            # extra_features (Goal): [B, extra_dim] (One-hot vector)
-            
-            # 1. Query: 直接使用 Goal (0/K/M)
-            # [B, 1, extra_dim]
-            query = self.goal_embedding(extra_features).unsqueeze(1)  # [B, 1, d_model]
-            
-            # 2. Key: 将 State 投影到类别空间
-            # 物理含义：预测每个时间步属于哪个类别
-            # [B, T, extra_dim]
-            keys = self.key_proj(enc_output)  # [B, T, d_model]
-            
-            # 3. Value: State 的特征表示
-            # [B, T, d_model]
-            values = self.value_proj(enc_output)
-            
-            # 4. 计算 Attention Scores: Query * Key^T
-            # [B, 1, extra_dim] @ [B, extra_dim, T] -> [B, 1, T]
-            # 含义：Goal类别 与 每个时间步的类别预测值 的匹配程度
-            scores = torch.bmm(query, keys.transpose(1, 2)) / (self.d_model ** 0.5)
-            
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            # 5. 加权求和得到 Context
-            # [B, 1, T] @ [B, T, d_model] -> [B, 1, d_model]
-            context = torch.bmm(attn_weights, values)
-            
-            # 融合: 将 Context 与最后一个时间步的特征相加 (残差连接) 并归一化
-            # 这样既保留了全局信息(last step)，又融入了Goal关注的特定片段信息
-            features_input = self.norm_cross(context.squeeze(1) + enc_output[:, -1, :])
-        else:
-            features_input = enc_output[:, -1, :]                 # [B, d_model]
-
-        features = self.relu(self.feature_layer(features_input))
+        out = self.encoder(x)
+        features = self.relu(self.feature_layer(out[:, -1, :]))
         values = self.value_stream(features)
         advantages = self.advantage_stream(features)
         q_values = values + advantages - advantages.mean(dim=1, keepdim=True)
         return q_values
-
-# class ImprovedTransformer(nn.Module):
-#     def __init__(self, input_shape, output_dim=2, d_model=128, n_heads=2, num_layers=2, dropout=0.1, extra_dim=0):
-#         super().__init__()
-#         len_window, feature_dim = input_shape
-        
-#         # 状态投影
-#         self.input_proj = nn.Linear(feature_dim, d_model)
-#         self.register_buffer("pos_encoding", self._build_positional_encoding(len_window, d_model))
-        
-#         encoder_layer = nn.TransformerEncoderLayer(
-#             d_model=d_model,
-#             nhead=n_heads,
-#             dim_feedforward=d_model * 4,
-#             dropout=dropout,
-#             batch_first=True,
-#         )
-#         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-#         # 引入 cross attention 以融合 Goal（extra_dim>0 时生效）
-#         self.extra_dim = extra_dim
-#         if extra_dim > 0:
-#             # 修改：实现基于类别的语义Attention
-#             # Key: 将振动数据投影到类别空间 (0/K/M)，维度为 extra_dim
-#             self.goal_embedding = nn.Linear(extra_dim, d_model)  # 学习goal表示
-#             self.key_proj = nn.Linear(d_model, d_model)  # 保持特征维度
-#             self.value_proj = nn.Linear(d_model, d_model)
-            
-#             self.dropout = nn.Dropout(dropout)
-#             self.norm_cross = nn.LayerNorm(d_model)
-#             # 移除原有的 MultiheadAttention，因为我们要手动控制 Q/K 的维度匹配
-
-#         # Dueling 头
-#         self.feature_layer = nn.Linear(d_model, 128)
-#         self.relu = nn.ReLU()
-#         self.value_stream = nn.Linear(128, 1)
-#         self.advantage_stream = nn.Linear(128, output_dim)
-
-#         # 新增：Goal门控机制
-#         self.goal_gate_proj = nn.Linear(d_model, d_model)
-
-#     def _build_positional_encoding(self, length, d_model):
-#         position = torch.arange(length, dtype=torch.float32).unsqueeze(1)
-#         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
-#         pe = torch.zeros(length, d_model, dtype=torch.float32)
-#         pe[:, 0::2] = torch.sin(position * div_term)
-#         pe[:, 1::2] = torch.cos(position * div_term)
-#         return pe.unsqueeze(0)
-
-#     def forward(self, x, extra_features=None):
-#         device = next(self.parameters()).device
-#         x = x.to(device).float()
-#         x = self.input_proj(x)
-#         x = x + self.pos_encoding[:, : x.size(1)].to(x.dtype)
-
-#         # 状态编码
-#         enc_output = self.encoder(x)  # [B, T, d_model]
-
-#         # 使用 Goal 作为 Query 进行 cross attention
-#         if self.extra_dim > 0 and extra_features is not None:
-#             # extra_features (Goal): [B, extra_dim] (One-hot vector)
-            
-#             # 1. Query: 直接使用 Goal (0/K/M)
-#             # [B, 1, extra_dim]
-#             query = self.goal_embedding(extra_features).unsqueeze(1)  # [B, 1, d_model]
-            
-#             # 2. Key: 将 State 投影到类别空间
-#             # 物理含义：预测每个时间步属于哪个类别
-#             # [B, T, extra_dim]
-#             keys = self.key_proj(enc_output)  # [B, T, d_model]
-            
-#             # 3. Value: State 的特征表示
-#             # [B, T, d_model]
-#             values = self.value_proj(enc_output)
-            
-#             # 4. 计算 Attention Scores: Query * Key^T
-#             # [B, 1, extra_dim] @ [B, extra_dim, T] -> [B, 1, T]
-#             # 含义：Goal类别 与 每个时间步的类别预测值 的匹配程度
-#             scores = torch.bmm(query, keys.transpose(1, 2)) / (d_model ** 0.5)
-            
-#             attn_weights = F.softmax(scores, dim=-1)
-#             attn_weights = self.dropout(attn_weights)
-            
-#             # 5. 加权求和得到 Context
-#             # [B, 1, T] @ [B, T, d_model] -> [B, 1, d_model]
-#             context = torch.bmm(attn_weights, values)
-            
-#             # 融合: 将 Context 与最后一个时间步的特征相加 (残差连接) 并归一化
-#             # 这样既保留了全局信息(last step)，又融入了Goal关注的特定片段信息
-#             features_input = self.norm_cross(context.squeeze(1) + enc_output[:, -1, :])
-#         else:
-#             features_input = enc_output[:, -1, :]                 # [B, d_model]
-
-#         # 1. 早期融合：Goal直接约束输入
-#         if extra_features is not None:
-#             goal_embed = self.goal_embedding(extra_features)  # [B, d_model]
-#             # 方式1：Goal作为初始偏置
-#             x = x + goal_embed.unsqueeze(1) * 0.3  # 早期约束
-        
-#         # 2. 中期融合：Goal门控机制
-#         enc_output = self.encoder(x)
-#         if extra_features is not None:
-#             goal_gate = torch.sigmoid(
-#                 self.goal_gate_proj(goal_embed)
-#             )  # [B, d_model]
-#             enc_output = enc_output * goal_gate.unsqueeze(1)
-        
-#         # 3. 晚期融合：原有的attention
-#         if extra_features is not None:
-#             context = self._cross_attention(enc_output, goal_embed)
-#             features_input = self.norm_cross(context + enc_output[:, -1, :])
-#         else:
-#             features_input = enc_output[:, -1, :]
-        
-#         return self.dueling_head(features_input)
