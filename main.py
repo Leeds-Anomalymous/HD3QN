@@ -28,10 +28,12 @@ def set_random_seed(seed):
 
 class HierarchicalTransformer(nn.Module):
     """低层策略的Transformer，使用 cross attention 融合 goal(one-hot)"""
-    def __init__(self, input_shape, goal_dim=3, output_dim=9):
+    # 增加 backbone 参数
+    def __init__(self, input_shape, goal_dim=3, output_dim=9, backbone=None):
         super(HierarchicalTransformer, self).__init__()
         # 引入 extra_dim=goal_dim，启用 Transformer 的 cross attention
-        self.transformer = Transformer(input_shape, output_dim=output_dim, extra_dim=goal_dim)
+        # 将 backbone 传递给 Transformer
+        self.transformer = Transformer(input_shape, output_dim=output_dim, extra_dim=goal_dim, backbone=backbone)
         
     def forward(self, state, goal):
         # goal 为 [B, 3] 的 one-hot，作为 extra_features 传入 cross attention
@@ -73,18 +75,40 @@ class HierarchicalDQN():
             2: 1, 3: 1, 5: 1, 6: 1, 8: 1  # K类
         }
         
-        # 高层策略网络 (输出3个高层目标: 0/K/M)
+        # --- 修改网络初始化逻辑以共享权重 ---
+        
+        # 1. 实例化高层网络 (作为主干)
         self.high_q_net = Transformer(input_shape, output_dim=3)
+        # 高层 Target Net 复制高层 Q Net
         self.high_target_net = Transformer(input_shape, output_dim=3)
         self.high_target_net.load_state_dict(self.high_q_net.state_dict())
         
-        # 低层策略网络 (输入state+goal, 输出9个类别)
-        self.low_q_net = HierarchicalTransformer(input_shape, goal_dim=3, output_dim=self.total_low_actions)
-        self.low_target_net = HierarchicalTransformer(input_shape, goal_dim=3, output_dim=self.total_low_actions)
+        # 2. 实例化低层网络 (共享高层网络的 Encoder)
+        # 注意：low_q_net 使用 high_q_net 的 backbone
+        self.low_q_net = HierarchicalTransformer(
+            input_shape, goal_dim=3, output_dim=self.total_low_actions, 
+            backbone=self.high_q_net
+        )
+        
+        # 3. 实例化低层 Target Net (共享高层 Target Net 的 Encoder)
+        # 这样 target 网络的更新也会同步
+        self.low_target_net = HierarchicalTransformer(
+            input_shape, goal_dim=3, output_dim=self.total_low_actions,
+            backbone=self.high_target_net
+        )
+        # 加载低层独有层的权重(如CrossAttention和Head)，主干部分已通过backbone参数共享引用
+        # 注意：这里只需加载 state_dict，但由于 backbone 是共享对象的引用，
+        # PyTorch 的 load_state_dict 会正确处理。为了安全，显式同步一下非 backbone 部分即可，
+        # 或者直接全量 load (稍微冗余但安全)
         self.low_target_net.load_state_dict(self.low_q_net.state_dict())
         
         # 优化器
+        # high_optimizer 更新 high_q_net (包括 Encoder + High Head)
         self.high_optimizer = optim.Adam(self.high_q_net.parameters(), lr=self.learning_rate)
+        
+        # low_optimizer 更新 low_q_net (包括 Encoder + Low Head + Cross Attention)
+        # 注意：由于 Encoder 对象是同一个，这里是多任务学习。
+        # 低层的梯度也会流向 Encoder，这有助于提取更细粒度的特征。
         self.low_optimizer = optim.Adam(self.low_q_net.parameters(), lr=self.learning_rate)
         
         # 经验回放池
@@ -423,7 +447,7 @@ def main():
     # ood_reward_scales = list(np.linspace(0.1, 1, 5))
     ood_reward_scales = [0.5]
     
-    save_dir = '/workspace/RL/HD3QN/No-cross-Norm_replay/results'
+    save_dir = '/workspace/RL/HD3QN/final'
     os.makedirs(save_dir, exist_ok=True)
     
     for model_variant in model_variants:
