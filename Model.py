@@ -75,19 +75,22 @@ class Transformer(nn.Module):
 
         # 引入 cross attention 以融合 Goal（extra_dim>0 时生效）
         self.extra_dim = extra_dim
-        if extra_dim > 0:
-            # 修改：实现基于类别的语义Attention
-            # Key: 将振动数据投影到类别空间 (0/K/M)，维度为 extra_dim
-            self.goal_embedding = nn.Linear(extra_dim, d_model)  # 学习goal表示
-            self.key_proj = nn.Linear(d_model, d_model)  # 保持特征维度
-            self.value_proj = nn.Linear(d_model, d_model)
+        # 消融实验：移除 Attention 组件，注释掉相关初始化
+        # if extra_dim > 0:
+        #     # 修改：实现基于类别的语义Attention
+        #     # Key: 将振动数据投影到类别空间 (0/K/M)，维度为 extra_dim
+        #     self.goal_embedding = nn.Linear(extra_dim, d_model)  # 学习goal表示
+        #     self.key_proj = nn.Linear(d_model, d_model)  # 保持特征维度
+        #     self.value_proj = nn.Linear(d_model, d_model)
             
-            self.dropout = nn.Dropout(dropout)
-            self.norm_cross = nn.LayerNorm(d_model)
-            # 移除原有的 MultiheadAttention，因为我们要手动控制 Q/K 的维度匹配
+        #     self.dropout = nn.Dropout(dropout)
+        #     self.norm_cross = nn.LayerNorm(d_model)
+        #     # 移除原有的 MultiheadAttention，因为我们要手动控制 Q/K 的维度匹配
 
         # Dueling 头
-        self.feature_layer = nn.Linear(d_model, 128)
+        # 修改：输入层维度调整为直接拼接后的维度 (d_model + extra_dim)
+        input_feature_dim = d_model + extra_dim if extra_dim > 0 else d_model
+        self.feature_layer = nn.Linear(input_feature_dim, 128)
         self.relu = nn.ReLU()
         self.value_stream = nn.Linear(128, 1)
         self.advantage_stream = nn.Linear(128, output_dim)
@@ -109,40 +112,16 @@ class Transformer(nn.Module):
         # 状态编码
         enc_output = self.encoder(x)  # [B, T, d_model]
 
-        # 使用 Goal 作为 Query 进行 cross attention
+        # 取最后一个时间步的状态特征
+        state_feat = enc_output[:, -1, :] # [B, d_model]
+
+        # 消融实验：移除 Cross Attention，改为直接拼接
         if self.extra_dim > 0 and extra_features is not None:
-            # extra_features (Goal): [B, extra_dim] (One-hot vector)
-            
-            # 1. Query: 直接使用 Goal (0/K/M)
-            # [B, 1, extra_dim]
-            query = self.goal_embedding(extra_features).unsqueeze(1)  # [B, 1, d_model]
-            
-            # 2. Key: 将 State 投影到类别空间
-            # 物理含义：预测每个时间步属于哪个类别
-            # [B, T, extra_dim]
-            keys = self.key_proj(enc_output)  # [B, T, d_model]
-            
-            # 3. Value: State 的特征表示
-            # [B, T, d_model]
-            values = self.value_proj(enc_output)
-            
-            # 4. 计算 Attention Scores: Query * Key^T
-            # [B, 1, extra_dim] @ [B, extra_dim, T] -> [B, 1, T]
-            # 含义：Goal类别 与 每个时间步的类别预测值 的匹配程度
-            scores = torch.bmm(query, keys.transpose(1, 2)) / (self.d_model ** 0.5)
-            
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            
-            # 5. 加权求和得到 Context
-            # [B, 1, T] @ [B, T, d_model] -> [B, 1, d_model]
-            context = torch.bmm(attn_weights, values)
-            
-            # 融合: 将 Context 与最后一个时间步的特征相加 (残差连接) 并归一化
-            # 这样既保留了全局信息(last step)，又融入了Goal关注的特定片段信息
-            features_input = self.norm_cross(context.squeeze(1) + enc_output[:, -1, :])
+             # extra_features (Goal): [B, extra_dim]
+             # 直接拼接 [State, Goal]
+             features_input = torch.cat([state_feat, extra_features], dim=1)
         else:
-            features_input = enc_output[:, -1, :]                 # [B, d_model]
+            features_input = state_feat
 
         features = self.relu(self.feature_layer(features_input))
         values = self.value_stream(features)

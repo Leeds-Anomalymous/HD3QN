@@ -195,36 +195,40 @@ class HierarchicalDQN():
             return masked_q.argmax().item()
 
     def compute_reward(self, action, target, level="low", high_action=None, true_goal=None):
-        """仅计算奖励"""
+        """计算奖励, 根据层级选择权重"""
         weights = self.high_reward_weights if level == "high" else self.reward_weights
         weight = weights.get(target, 1.0)
-        
-        # 1. 高层奖励计算
-        if level == "high":
-            if action == target:
-                return weight * self.reward_multiplier
-            else:
-                return -weight * self.reward_multiplier
+        terminal = False
+        update = True
 
-        # 2. 低层奖励计算
-        if level == "low":
-            # 正常情况：高层正确
-            if high_action == true_goal:
-                if action == target:
-                    return weight * self.reward_multiplier
-                else:
-                    return -weight * self.reward_multiplier
-            
-            # 特殊情况：高层错误 (纠错机制)
-            else:
+        # 低层 OOD 特殊情况：仅处理高层错误时的纠错奖励
+        if level == "low" and high_action is not None and true_goal is not None:
+            # 如果高层选择错误
+            if high_action != true_goal:
                 if action == self.ood_action:
                     # 纠错成功：给予带权重的正奖励（较小）
-                    return self.reward_multiplier * self.ood_reward_scale * weight
+                    reward = self.reward_multiplier * self.ood_reward_scale * weight
+                    update = True
                 else:
-                    # 错上加错
-                    return -weight * self.reward_multiplier
+                    # 错上加错：给予标准惩罚
+                    reward = -weight * self.reward_multiplier
+                    update = False
+                terminal = True  # 高层错误时必须终止
+                return reward, terminal, update
+                
+        # 正常奖励计算
+        # 涵盖了：
+        # 1. 高层策略的奖励计算
+        # 2. 高层正确时，低层策略的奖励计算（包括选对、选错类、选OOD）
+        if action == target:
+            reward = weight * self.reward_multiplier
+        else:
+            # 选错（包括在高层正确时选了OOD）
+            reward = -weight * self.reward_multiplier
+            terminal = True
+            update = False
         
-        return 0
+        return reward, terminal, update
 
     def replay_high_level(self, update_target=True):
         """训练高层策略"""
@@ -246,7 +250,6 @@ class HierarchicalDQN():
         # 计算目标Q值 - 使用高层折扣因子
         with torch.no_grad():
             next_q = self.high_target_net(next_states).max(1, keepdim=True)[0]
-            # 如果是 terminal，则 target = reward
             target_q = rewards + self.high_discount_factor * next_q * (~terminals)
         
         # 计算损失并更新
@@ -257,15 +260,15 @@ class HierarchicalDQN():
         loss.backward()
         self.high_optimizer.step()
         
-        # 软更新目标网络 - 始终更新
+        # 软更新目标网络 - 使用高层eta
         if update_target:
             for target_param, param in zip(self.high_target_net.parameters(), self.high_q_net.parameters()):
                 target_param.data.copy_(self.high_eta * param.data + (1.0 - self.high_eta) * target_param.data)
 
     def replay_low_level(self, update_target=True):
         """训练低层策略"""
-        if len(self.low_replay_memory) < self.batch_size: # 增加此行以避免batch不足时报错
-             return
+        # if len(self.low_replay_memory) < self.batch_size:
+        #     return
             
         batch = random.sample(self.low_replay_memory, self.batch_size)
         states, goals, actions, rewards, next_states, next_goals, terminals = zip(*batch)
@@ -301,7 +304,7 @@ class HierarchicalDQN():
         loss.backward()
         self.low_optimizer.step()
         
-        # 软更新目标网络 - 始终更新
+        # 软更新目标网络 - 使用低层eta
         if update_target:
             for target_param, param in zip(self.low_target_net.parameters(), self.low_q_net.parameters()):
                 target_param.data.copy_(self.low_eta * param.data + (1.0 - self.low_eta) * target_param.data)
@@ -339,24 +342,16 @@ class HierarchicalDQN():
                     
                     # 获取真实的高层目标
                     true_goal = self.get_goal_from_label(current_label)
+                    next_true_goal = self.get_goal_from_label(next_label)
                     
-                    # 1. 高层策略选择目标
+                    # 1. 高层策略选择目标(做一次决策)
                     high_action = self.select_high_level_action(current_state)
                     goal_onehot = F.one_hot(torch.tensor([high_action]), num_classes=3).float()
                     
-                    # 2. 低层策略选择动作
-                    low_action = self.select_low_level_action(current_state, high_action)
-                    
-                    # --- 统一的 Terminal 逻辑 ---
-                    # 只有当：高层选对目标 AND 低层选对类别 时，Terminal才为False
-                    # 其他情况（包括高层错、低层错、或高层错低层进行纠错）都视为 True (Episode 在此处断开)
-                    is_all_correct = (high_action == true_goal) and (low_action == current_label)
-                    terminal = not is_all_correct
-                    
-                    # 3. 计算奖励
-                    high_reward = self.compute_reward(high_action, true_goal, level="high")
-                    low_reward = self.compute_reward(low_action, current_label, level="low", 
-                                                   high_action=high_action, true_goal=true_goal)
+                    # 计算高层奖励
+                    high_reward, high_terminal, high_update = self.compute_reward(
+                        high_action, true_goal, level="high"
+                    )
                     
                     # 存储高层经验
                     self.high_replay_memory.append((
@@ -364,31 +359,41 @@ class HierarchicalDQN():
                         high_action,
                         high_reward,
                         next_state.squeeze(0).cpu().clone().detach(),
-                        terminal  # 使用统一的 terminal
+                        high_terminal
                     ))
                     
-                    # 下一步的目标(用于低层Next Q计算)
+                    # 2. 低层策略选择动作(做一次决策)
+                    low_action = self.select_low_level_action(current_state, high_action)
+                    
+                    # 计算低层奖励
+                    low_reward, low_terminal, low_update = self.compute_reward(
+                        low_action, current_label, level="low",
+                        high_action=high_action, true_goal=true_goal
+                    )
+                    
+                    # 下一步的目标(基于下一状态的高层决策)
+                    # [修改] 启用下一目标的计算，因为低层价值评估依赖于下一时刻高层实际给出的Goal
                     next_high_action = self.select_high_level_action(next_state)
                     next_goal_onehot = F.one_hot(torch.tensor([next_high_action]), num_classes=3).float()
                     
                     # 存储低层经验
                     self.low_replay_memory.append((
-                        current_state.squeeze(0).cpu().clone().detach(),
-                        goal_onehot.squeeze(0).cpu().clone().detach(),
-                        low_action,
-                        low_reward,
-                        next_state.squeeze(0).cpu().clone().detach(),
-                        next_goal_onehot.squeeze(0).cpu().clone().detach(),
-                        terminal  # 使用统一的 terminal
+                        current_state.squeeze(0).cpu().clone().detach(),      # 当前状态
+                        goal_onehot.squeeze(0).cpu().clone().detach(),        # 当前目标
+                        low_action,                                            # 选择的动作
+                        low_reward,                                            # 获得的奖励
+                        next_state.squeeze(0).cpu().clone().detach(),         # 下一状态
+                        next_goal_onehot.squeeze(0).cpu().clone().detach(),   # [修改] 使用 next_goal_onehot
+                        low_terminal                                           # 是否终止
                     ))
                     
-                    # 4. 训练网络
+                    # 3. 训练网络
                     performed_update = False
                     if len(self.high_replay_memory) >= self.batch_size:
-                        self.replay_high_level(update_target=True) # 始终更新
+                        self.replay_high_level(update_target=high_update)
                         performed_update = True
                     if len(self.low_replay_memory) >= self.batch_size:
-                        self.replay_low_level(update_target=True) # 始终更新
+                        self.replay_low_level(update_target=low_update)
                         performed_update = True
                     
                     # 更新计数器
@@ -442,7 +447,7 @@ def main():
     # ood_reward_scales = list(np.linspace(0.1, 1, 5))
     ood_reward_scales = [0.5]
     
-    save_dir = '/workspace/RL/HD3QN/final'
+    save_dir = '/workspace/RL/HD3QN/No-attention/results'
     os.makedirs(save_dir, exist_ok=True)
     
     for model_variant in model_variants:
